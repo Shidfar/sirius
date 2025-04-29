@@ -1,0 +1,12 @@
+[package]
+name = "sirius"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kokoro = { path = "./kokoro" }
+
+tokio = { version = "1.44.2", features = ["io-util", "rt-multi-thread", "io-std"] }
+kira = { version = "0.10.6", features = ["wav"] }
+
+hound = { version = "3.5.1" }
