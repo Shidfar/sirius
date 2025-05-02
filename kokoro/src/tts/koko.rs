@@ -298,7 +298,8 @@ impl TTSKoko {
 
             for (name, portion) in style_names.iter().zip(style_portions.iter()) {
                 if let Some(style) = self.styles.get(*name) {
-                    let style_slice = &style[tokens_len][0]; // This is a [256] array
+                    let si = std::cmp::min(tokens_len, style.len() - 1);
+                    let style_slice = &style[si][0]; // This is a [256] array
                                                              // Blend into the blended_style
                     for j in 0..256 {
                         blended_style[0][j] += style_slice[j] * portion;

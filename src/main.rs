@@ -1,137 +1,172 @@
+mod audio;
+mod pdfreader;
+mod commands;
+mod sirius;
+
 use kokoro::tts::koko::TTSKoko;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use kira::{
-    backend::cpal::CpalBackend, sound::static_sound::StaticSoundData,
-    AudioManager,
-    AudioManagerSettings,
-};
 
-use hound::{WavSpec, WavWriter};
-use std::io::Cursor;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use unicode_segmentation::UnicodeSegmentation;
 
-fn save_f32_buffer(save_path: &str, audio: &Vec<f32>, channels: u16, sample_rate: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let spec = WavSpec {
-        channels,
-        sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
+// #[derive(Debug)]
+// struct Done {
+//     message: String,
+// }
+
+fn read_page(tts: &TTSKoko, path: &str, idx: u32, page: Vec<String>, remove_top: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let path_obj = Path::new(path);
+    let stem = path_obj.file_stem()
+        .and_then(|os_str| os_str.to_str())
+        .ok_or_else(|| format!("Could not extract valid UTF-8 filename stem from '{}'", path))?;
+    std::fs::create_dir_all(format!("data/voices/{stem}/"))?;
+    let output_file = format!("data/voices/{stem}/{stem}-{idx}.wav");
+    println!("Output file: {}", output_file);
+
+    let lines_to_process = if remove_top && !page.is_empty() {
+        &page[1..]
+    } else {
+        &page[..]
     };
 
-    let mut writer = hound::WavWriter::create(save_path, spec)?;
-    for &sample in audio {
-        writer.write_sample(sample)?;
+    let sentences: Vec<String> = lines_to_process
+        .iter()
+        .flat_map(|txt| txt.split_sentence_bounds())
+        .map(String::from)
+        .collect();
+
+    if sentences.is_empty() {
+        println!("No sentences found to synthesize.");
+        return Ok(());
     }
-    writer.finalize()?;
+
+    println!("Found {} sentences.", sentences.len());
+
+    let mut audio: Vec<f32> = Vec::new();
+    for sentence in &sentences {
+        println!("  Generating for: '{}'", sentence);
+        match audio::generate(tts, sentence, &mut audio) {
+            Ok(_) => println!("   -> done"),
+            Err(e) => {
+                eprintln!("Error generating audio for sentence: '{}'. Error: {}", sentence, e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    if !audio.is_empty() {
+        const CHANNELS: u16 = 1;
+        const SAMPLE_RATE: u32 = 24000;
+
+        println!("Saving audio ({} samples) to {}...", audio.len(), output_file);
+        audio::save_f32_buffer(&output_file, &audio, CHANNELS, SAMPLE_RATE)?;
+        // audio::play_f32_buffer(&audio, CHANNELS, SAMPLE_RATE)?;
+    } else {
+        eprintln!("Warning: Audio buffer is empty after processing. Skipping save for {}.", output_file);
+    }
 
     Ok(())
 }
 
-fn play_f32_buffer(
-    samples: &[f32], // Use a slice for flexibility
-    channels: u16,
-    sample_rate: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Convert f32 samples to i16 (kira expects audio in i16 format)
-    let i16_samples: Vec<i16> = samples
-        .iter()
-        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-        .collect();
+fn read_doc(tts: &TTSKoko, path: &str, remove_top: bool) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Input path: {}", path);
 
-    // Create a WAV buffer in memory using a Cursor
-    let mut wav_buffer = Cursor::new(Vec::new());
-    {
-        let spec = WavSpec {
-            channels,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = WavWriter::new(&mut wav_buffer, spec)?;
-        for sample in i16_samples {
-            writer.write_sample(sample)?;
-        }
-        writer.finalize()?; // Finalize the WAV file
+    let tree: BTreeMap<u32, Vec<String>> = pdfreader::read(path)?;
+    for (page_n, parts) in tree {
+        read_page(&tts, path, page_n, parts, remove_top)?
     }
 
-    // Reset the cursor to the beginning of the buffer
-    wav_buffer.set_position(0);
-
-    // Specify the backend type for the AudioManager
-    let mut manager = AudioManager::<CpalBackend>::new(AudioManagerSettings::default())?;
-    let sound_data = StaticSoundData::from_cursor(
-        wav_buffer,
-        // StaticSoundSettings::default(),
-    )?;
-
-    // Play the sound
-    let _handle = manager.play(sound_data)?;
-
-    // Calculate approximate duration of audio
-    let duration_secs = samples.len() as f32 / (sample_rate as f32 * channels as f32);
-    std::thread::sleep(std::time::Duration::from_secs_f32(duration_secs));
-
     Ok(())
+}
+
+fn list_docs() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let folder_path = "data/docs";
+
+    let pdf_files: Vec<_> = std::fs::read_dir(folder_path)?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let is_pdf = path.extension()?
+                .to_str()?
+                .eq_ignore_ascii_case("pdf");
+
+            if is_pdf {
+                Some(path)
+            } else {
+                None
+            }
+        }).collect();
+
+    let paths: Vec<String> = pdf_files.iter()
+        .filter_map(|path_buf: &PathBuf| {
+            path_buf.to_str()
+        }).map(String::from)
+        .collect();
+
+    Ok(paths)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    const LIST: &str = "://list";
+    const READ: &str = "://read";
+    let mut docs = list_docs()?;
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-
         let tts = TTSKoko::new("checkpoints/kokoro-v1.0.onnx", "data/voices-v1.0.bin").await;
 
         let stdin = tokio::io::stdin();
         let reader = BufReader::new(stdin);
         let mut lines = reader.lines();
 
-        eprintln!("Entering streaming mode. Type text and press Enter. Use Ctrl+D to exit.");
-
-        let mut full_audio: Vec<f32> = Vec::new();
-
         while let Some(line) = lines.next_line().await? {
             let stripped_line = line.trim();
             if stripped_line.is_empty() {
                 continue;
-            }
-
-            if stripped_line == "::command://play" {
-                play_f32_buffer(&full_audio, 1, 24000)?;
-                continue;
-            }
-
-            if stripped_line == "::command://flush" {
-                full_audio = Vec::new();
-                println!("Audio buffer is cleared");
-                continue
-            }
-
-            if stripped_line.starts_with("::command://save") {
+            } else if stripped_line == LIST {
+                docs = list_docs()?;
+                println!("Found {} PDF(s):", docs.len());
+                for (i, pdf) in docs.iter().enumerate() {
+                    println!("{}: {}", i+1, pdf);
+                }
+            } else if stripped_line.starts_with(READ) {
                 let command_parts: Vec<&str> = stripped_line.split_whitespace().collect();
-                if command_parts.len() != 2 {
-                    eprintln!("Output file is not specified. Ignoring command.");
+                if command_parts.len() > 3 || command_parts.len() < 2 {
+                    eprintln!("Usage: {READ} <doc_index> [true|1|yes]");
                     continue;
                 }
-                let filename = command_parts[1];
-                save_f32_buffer(filename, &full_audio, 1, 24000)?;
-                println!("Saving to {filename} is done");
-                continue;
-            }
 
-            let s = std::time::Instant::now();
+                let ignore_top = command_parts.len() == 3;
 
-            match tts.tts_raw_audio(&stripped_line, "en-us", "af_heart.4+af_bella.6", 1.0, None) {
-                Ok(raw_audio) => {
-                    full_audio.extend_from_slice(&raw_audio);
+                let idx_str = command_parts[1];
+                match idx_str.parse::<usize>() {
+                    Ok(idx) => {
+                        if idx - 1 >= docs.len() || idx == 0 {
+                            eprintln!("Error: Document index {} is out of bounds (max index is {}).", idx, if docs.is_empty() { 0 } else { docs.len() });
+                            continue;
+                        }
 
-                    eprintln!("Audio buffered up. Ready for another line of text.");
+                        let path_to_read = &docs[idx - 1];
+                        println!("Executing: read_doc for index {}, path '{}', ignore_top: {}", idx, path_to_read, ignore_top);
+
+                        if let Err(read_err) = read_doc(&tts, path_to_read, ignore_top) {
+                            eprintln!("Error reading document '{}': {}", path_to_read, read_err);
+                        }
+                    }
+                    Err(parse_err) => {
+                        eprintln!("Error: Invalid document index '{}'. Index must be a number. Parser error: {}", idx_str, parse_err);
+                    }
+                };
+            } else {
+                println!("------- Commands ---------");
+                println!("{LIST} - will list all pdf docs in data/docs dir");
+                println!("{READ} <doc_index> [true|1|yes] - will read the doc at index optionally skipping the header");
+                println!("------- PDF LIST ---------");
+                for (i, pdf) in docs.iter().enumerate() {
+                    println!("{}: {}", i+1, pdf);
                 }
-                Err(e) => eprintln!("Error processing line: {}", e),
             }
-
-            println!("Time taken: {:?}", s.elapsed());
-            let words_per_second =
-                stripped_line.split_whitespace().count() as f32 / s.elapsed().as_secs_f32();
-            println!("Words per second: {:.2}", words_per_second);
         }
 
         Ok(())
