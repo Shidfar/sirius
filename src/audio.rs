@@ -76,18 +76,29 @@ pub fn play_f32_buffer(
 
 pub fn generate(tts: &TTSKoko, text: &str, full_audio: &mut Vec<f32>) -> Result<(), Box<dyn std::error::Error>> {
     let s = std::time::Instant::now();
+    // "af_heart.4+af_bella.6"
+    // "bm_daniel", "bm_fable", "bm_george", "bm_lewis"
 
-    match tts.tts_raw_audio(&text, "en-us", "af_heart.4+af_bella.6", 1.0, None) {
-        Ok(raw_audio) => {
-            full_audio.extend_from_slice(&raw_audio);
-            // eprintln!("Audio buffered up. Ready for another line of text.");
+    let sentences = text.split('.');
+
+    for sentence in sentences {
+        let trimmed = sentence.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-        Err(e) => eprintln!("Error processing line: {}", e),
-    }
 
-    println!("Time taken: {:?}", s.elapsed());
-    let words_per_second = text.split_whitespace().count() as f32 / s.elapsed().as_secs_f32();
-    println!("Words per second: {:.2}", words_per_second);
+        match tts.tts_raw_audio(&trimmed, "en-us", "am_onyx.4+bm_lewis.6", 0.99, None) {
+            Ok(raw_audio) => {
+                full_audio.extend_from_slice(&raw_audio);
+                // eprintln!("Audio buffered up. Ready for another line of text.");
+            }
+            Err(e) => eprintln!("Error processing line: {}", e),
+        }
+
+        println!("Time taken: {:?}", s.elapsed());
+        let words_per_second = text.split_whitespace().count() as f32 / s.elapsed().as_secs_f32();
+        println!("Words per second: {:.2}", words_per_second);
+    }
 
     Ok(())
 }

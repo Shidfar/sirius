@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use kokoro::tts::koko::TTSKoko;
 
 
-fn start() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn start() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
 
     const PLAY: &str = "://play";
@@ -28,8 +28,13 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Audio buffer is cleared");
                 continue;
             } else {
-                audio::generate(&tts, stripped_line, &mut full_audio)?
+                audio::generate(&tts, stripped_line, &mut full_audio)?;
+                // Optionally play the audio
+                // audio::play_f32_buffer(&full_audio, 1, 24000)?;
+                let output_path = "output/final/final.mp3".to_string();
+                audio::save_f32_buffer(&output_path, &full_audio, 1, 24000)?;
             }
+
         }
 
         Ok(())
