@@ -79,9 +79,23 @@ pub fn generate(tts: &TTSKoko, text: &str, full_audio: &mut Vec<f32>) -> Result<
     // "af_heart.4+af_bella.6"
     // "bm_daniel", "bm_fable", "bm_george", "bm_lewis"
 
-    let sentences = text.split('.');
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        current.push(ch);
+        if ch == '.' || ch == '!' || ch == '?' {
+            sentences.push(current.trim().to_string());
+            current.clear();
+        }
+    }
+
+    if !current.trim().is_empty() {
+        sentences.push(current.trim().to_string());
+    }
 
     for sentence in sentences {
+        println!("sentence: {sentence}");
         let trimmed = sentence.trim();
         if trimmed.is_empty() {
             continue;
