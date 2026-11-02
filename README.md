@@ -1,152 +1,34 @@
-# Sirius TTS - Client/Server Architecture
+# gigaam-c — Russian speech-to-text in plain C
 
-A WebSocket-based TTS service using Kokoro for speech synthesis.
+GigaAM-v3 (RNN-T, int8) running through ONNX Runtime's C API. No Python at runtime.
 
-## Architecture
-
-```
-┌─────────────────┐         WebSocket          ┌─────────────────┐
-│                 │  ───── text (JSON) ─────>  │                 │
-│     Client      │                            │     Server      │
-│  (sends text,   │  <──── WAV audio ───────   │  (loads Kokoro, │
-│   plays audio)  │                            │   synthesizes)  │
-└─────────────────┘                            └─────────────────┘
-```
-
-## Protocol
-
-The protocol is simple and uses two message types:
-
-### Client → Server (JSON)
-```json
-{
-  "type": "Synthesize",
-  "data": {
-    "text": "Hello, world!",
-    "voice": "am_onyx.4+bm_lewis.6",
-    "lang": "en-us",
-    "speed": 0.99
-  }
-}
-```
-
-### Server → Client
-1. **Metadata** (JSON):
-```json
-{
-  "type": "AudioReady",
-  "duration_secs": 1.5,
-  "sample_rate": 24000,
-  "channels": 1,
-  "size_bytes": 72044
-}
-```
-
-2. **Audio** (Binary): Raw WAV file bytes
-
-## Project Structure
-
-```
-sirius/
-├── Cargo.toml          # Workspace root
-├── protocol/           # Shared types (Request, Response)
-│   └── src/lib.rs
-├── server/             # TTS server
-│   └── src/
-│       ├── main.rs     # WebSocket server
-│       └── tts.rs      # Kokoro wrapper
-├── client/             # TTS client
-│   └── src/
-│       ├── main.rs     # CLI client
-│       └── audio.rs    # Audio playback
-└── legacy/             # Old standalone code
-```
-
-## Usage
-
-### Start the Server
+## Build and run (x86_64 or 64-bit Raspberry Pi OS)
 
 ```bash
-# Default: listens on ws://127.0.0.1:9876
-cargo run --release -p sirius-server
-
-# Custom address
-SIRIUS_ADDR=0.0.0.0:9876 cargo run --release -p sirius-server
-
-# Custom model paths
-SIRIUS_MODEL=path/to/model.onnx SIRIUS_VOICES=path/to/voices.bin cargo run --release -p sirius-server
+sudo apt install build-essential curl unzip ffmpeg   # Debian / Pi OS
+./fetch.sh        # ONNX Runtime (headers + .so) and the int8 models, ~400 MB
+make
+ffmpeg -i recording.m4a -ar 16000 -ac 1 -c:a pcm_s16le recording.wav
+./gigaam -v recording.wav
 ```
 
-### Use the Client
+Options: `-t N` threads (default: all cores), `-c SEC` max chunk length (default 20, `0` = no chunking),
+`-m DIR` model directory (default `./models`), `-v` timing and peak memory on stderr.
 
-```bash
-# Interactive mode
-cargo run --release -p sirius-client
+Input must be 16-bit PCM, mono, 16 kHz WAV.
 
-# Single text
-cargo run --release -p sirius-client -- --text "Hello, world!"
+## Files
 
-# Save to file instead of playing
-cargo run --release -p sirius-client -- --text "Hello" --output hello.wav
+| File | What it is |
+|---|---|
+| `gigaam.c` | The whole program: WAV reader, ONNX Runtime calls, greedy RNN-T decoder, text cleanup, chunking |
+| `fetch.sh` | Downloads ONNX Runtime from NuGet (picks x64 or arm64) and the models from Hugging Face |
+| `models/gigaam_v3.onnx` | Log-mel feature extractor, taken from the [onnx-asr](https://github.com/istupakov/onnx-asr) package (MIT) |
+| `models/v3_e2e_rnnt_*` | GigaAM-v3 int8 encoder / decoder / joint / vocab from `istupakov/gigaam-v3-onnx` |
 
-# Custom server/voice
-cargo run --release -p sirius-client -- --server ws://192.168.1.100:9876 --voice "bm_lewis" --text "Test"
-```
+## Notes
 
-### Interactive Mode Commands
-
-```
-> Hello, world!           # Type text and press Enter to synthesize
-> :v bm_daniel           # Change voice
-> :s 1.2                 # Change speed (0.5-2.0)
-> :q                     # Quit
-```
-
-## Configuration
-
-### Server Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIRIUS_ADDR` | `127.0.0.1:9876` | Listen address |
-| `SIRIUS_MODEL` | `checkpoints/kokoro-v1.0.onnx` | Path to ONNX model |
-| `SIRIUS_VOICES` | `data/voices-v1.0.bin` | Path to voices file |
-
-### Client CLI Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `-s, --server` | `ws://127.0.0.1:9876` | Server WebSocket URL |
-| `-t, --text` | (none) | Text to synthesize (interactive if omitted) |
-| `-o, --output` | (none) | Output WAV file (plays if omitted) |
-| `-v, --voice` | `am_onyx.4+bm_lewis.6` | Voice to use |
-| `-l, --lang` | `en-us` | Language code |
-| `--speed` | `0.99` | Speech speed (0.5-2.0) |
-
-## Building
-
-```bash
-# Build everything
-cargo build --release
-
-# Build only server
-cargo build --release -p sirius-server
-
-# Build only client  
-cargo build --release -p sirius-client
-```
-
-## Dependencies Note
-
-The server depends on `kokoro` - adjust the path in `server/Cargo.toml` to point to your local kokoro-rs installation:
-
-```toml
-kokoro = { path = "../../kokoro-rs" }  # Adjust this path
-```
-
-
-### Kudos to:
-
-https://github.com/lucasjinreal/Kokoros
-
-https://huggingface.co/spaces/hexgrad/Kokoro-TTS
+- 32-bit Raspberry Pi OS is not supported: the ONNX Runtime package has no 32-bit ARM library.
+- Long audio is cut at the quietest point near each chunk limit. Chunking changes the transcript.
+- Verified on x86_64 only: the whole-file output is byte-identical to the Python (`onnx-asr`) int8 RNN-T output.
+  The aarch64 build was checked under QEMU emulation (same text on an 8 s clip), not on real hardware.

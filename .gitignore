@@ -1,1 +1,6 @@
-/target
+# built binary
+/gigaam
+# downloaded by ./fetch.sh
+/ort/
+/models/*
+!/models/gigaam_v3.onnx
