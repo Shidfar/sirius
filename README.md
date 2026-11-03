@@ -12,10 +12,7 @@ ffmpeg -i recording.m4a -ar 16000 -ac 1 -c:a pcm_s16le recording.wav
 ./gigaam -v recording.wav
 ```
 
-Options: `-t N` threads (default: all cores), `-c SEC` max chunk length (default 20, `0` = no chunking),
-`-m DIR` model directory (default `./models`), `-v` timing and peak memory on stderr.
-
-Input must be 16-bit PCM, mono, 16 kHz WAV.
+Run `./gigaam` with no arguments to list the options. Input must be 16-bit PCM, mono, 16 kHz WAV.
 
 ## Files
 
@@ -30,5 +27,6 @@ Input must be 16-bit PCM, mono, 16 kHz WAV.
 
 - 32-bit Raspberry Pi OS is not supported: the ONNX Runtime package has no 32-bit ARM library.
 - Long audio is cut at the quietest point near each chunk limit. Chunking changes the transcript.
+- On glibc the program pins `M_MMAP_THRESHOLD`; without it peak memory is ~100 MB higher and varies with the input.
 - Verified on x86_64 only: the whole-file output is byte-identical to the Python (`onnx-asr`) int8 RNN-T output.
   The aarch64 build was checked under QEMU emulation (same text on an 8 s clip), not on real hardware.
