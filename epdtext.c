@@ -33,6 +33,7 @@
 #include "EPD_2in13_V4.h"
 #endif
 
+#include "epd.h"
 #include "font8x16.h"
 
 #define PANEL_W 122                         /* the panel's native (portrait) size */
@@ -66,6 +67,14 @@ static void set_black(int x, int y) {
     preview[y][x] = 1;
 }
 
+/* Whitens pixel (x, y): used for the text of an inverted line. */
+static void set_white(int x, int y) {
+    int nx = flip ? PANEL_W - 1 - y : y;
+    int ny = flip ? x : PANEL_H - 1 - x;
+    panel[ny * ROW_BYTES + nx / 8] |= (uint8_t)(0x80 >> (nx % 8));
+    preview[y][x] = 0;
+}
+
 static const uint8_t *glyph(uint32_t cp) {
     for (int pass = 0; pass < 2; pass++) {      /* second pass: fall back to '?' */
         int lo = 0, hi = FONT_N - 1;
@@ -79,12 +88,17 @@ static const uint8_t *glyph(uint32_t cp) {
     return FONT_BITS[0];
 }
 
-static void draw_glyph(int col, int row, uint32_t cp) {
+static void draw_glyph_ink(int col, int row, uint32_t cp, int black) {
     const uint8_t *g = glyph(cp);
     for (int y = 0; y < GLYPH_H; y++)
         for (int x = 0; x < GLYPH_W; x++)
-            if (g[y] & (0x80 >> x)) set_black(MARGIN_X + col * GLYPH_W + x, MARGIN_Y + row * GLYPH_H + y);
+            if (g[y] & (0x80 >> x)) {
+                if (black) set_black(MARGIN_X + col * GLYPH_W + x, MARGIN_Y + row * GLYPH_H + y);
+                else set_white(MARGIN_X + col * GLYPH_W + x, MARGIN_Y + row * GLYPH_H + y);
+            }
 }
+
+static void draw_glyph(int col, int row, uint32_t cp) { draw_glyph_ink(col, row, cp, 1); }
 
 /* ---------------------------------------------------------------- text -- */
 
@@ -158,6 +172,39 @@ static void render_text(const char *text) {
         for (int c = 0; c < lines[r].n; c++) draw_glyph(c, r, lines[r].cp[c]);
     free(cps);
     free(words);
+}
+
+/* A status screen: the lines of `text` (separated by '\n') go on rows 0.., cut at COLS columns. A line that starts
+ * with '!' is drawn white on a black bar the width of the panel. */
+static void render_lines(const char *text) {
+    memset(panel, 0xFF, sizeof panel);
+    memset(preview, 0, sizeof preview);
+    const unsigned char *p = (const unsigned char *)text;
+    for (int row = 0; row < ROWS && *p; row++) {
+        int invert = *p == '!';
+        if (invert) {
+            p++;
+            for (int y = MARGIN_Y + row * GLYPH_H; y < MARGIN_Y + (row + 1) * GLYPH_H; y++)
+                for (int x = 0; x < W; x++) set_black(x, y);
+        }
+        for (int col = 0; *p && *p != '\n'; ) {
+            uint32_t cp = utf8_next(&p);
+            if (col < COLS) draw_glyph_ink(col++, row, cp, !invert);
+        }
+        if (*p == '\n') p++;
+    }
+}
+
+void epd_draw_screen(const char *text, int flip_picture) {
+    flip = flip_picture;
+    render_lines(text);
+}
+
+static void write_preview(const char *path);
+
+int epd_write_preview(const char *path) {
+    write_preview(path);
+    return 0;
 }
 
 static char *read_stdin(void) {
@@ -238,6 +285,24 @@ static void show_in_child(double timeout) {
     }
 }
 #endif
+
+/* Starts sending the picture to the panel in a child process and returns its pid (the caller reaps it and decides
+ * when to give up on it), or -1 if there is no display support. */
+pid_t epd_update_start(void) {
+#ifdef HAVE_EPD
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        show();
+        fflush(NULL);
+        _exit(0);
+    }
+    return pid;
+#else
+    return -1;
+#endif
+}
 
 /* Draws `text` and shows it. A positive `timeout` (loop mode) runs the display update in a child process. */
 static void refresh(const char *text, const char *preview_path, double timeout) {

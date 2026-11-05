@@ -125,8 +125,10 @@ autotools curl curl-8.11.1 --with-mbedtls="$PREFIX" --without-zlib --without-bro
   --disable-ares --disable-curldebug --disable-verbose --without-libgsasl --disable-progress-meter
 
 # ALSA: capture only. It reads /usr/share/alsa/alsa.conf at run time (part of Raspberry Pi OS).
-stamp alsa || unpack alsa-lib-1.2.12.tar.bz2 alsa-lib-1.2.12
-autotools alsa alsa-lib-1.2.12 --disable-python --disable-mixer --disable-rawmidi --disable-seq --disable-ucm --disable-topology \
+# (Built without libtool's -DPIC although the code is position independent: that is how alsa-lib knows it is linked
+# statically and finds its built-in plugins and config hooks instead of searching for shared libraries.)
+stamp alsa2 || unpack alsa-lib-1.2.12.tar.bz2 alsa-lib-1.2.12
+autotools alsa2 alsa-lib-1.2.12 --with-pic=no --disable-python --disable-mixer --disable-rawmidi --disable-seq --disable-ucm --disable-topology \
   --disable-hwdep --disable-aload --disable-old-symbols --disable-alisp --disable-resmgr --disable-debug --with-configdir=/usr/share/alsa
 
 # lgpio (GPIO + SPI for the e-Paper driver): only the library part of the project

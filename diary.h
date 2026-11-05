@@ -12,7 +12,11 @@ void diary_write(DiaryW *w, const void *pcm, size_t n);
 void diary_finish(DiaryW *w);
 
 /* Decrypts FILE to out_fd. Returns 0 when complete, 3 when cut short (power cut: everything up to the last whole
- * chunk was written), 4 when a chunk failed authentication (damaged or tampered file), 1 when it is no diary file. */
+ * chunk was written), 4 when a chunk failed authentication (damaged or tampered file), 5 when out_fd cannot be written,
+ * 1 when it is no diary file. */
 int diary_cat(const char *path, int out_fd);
+
+/* 1 while another process is writing FILE (it holds a lock on it); a file left by a crash or power cut is not in use. */
+int diary_in_use(const char *path);
 
 int diary_main(int argc, char **argv);

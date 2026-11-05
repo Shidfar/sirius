@@ -24,16 +24,16 @@ MAX_GLIBC  = 36
 
 CFLAGS    ?= -O2
 CFLAGS    += -Wall -Wextra -std=gnu11 -fPIE -I$(DEPS)/include -Iort/include -Iepd
-LDLIBS     = -L$(DEPS)/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lopus -logg -lsodium -llgpio -lm -lpthread -ldl
+LDLIBS     = -L$(DEPS)/lib -lcurl -lasound -lmbedtls -lmbedx509 -lmbedcrypto -lopus -logg -lsodium -llgpio -lm -lpthread -ldl
 
-SRC        = sirius.c gigaam.c diary.c epdtext.c ortload.c age.c oggopus.c s3.c
+SRC        = sirius.c gigaam.c diary.c epdtext.c ortload.c age.c oggopus.c s3.c config.c rec.c entry.c daemon.c install.c
 EPD        = DEV_Config dev_hardware_SPI EPD_2in13_V4
 OBJ        = $(SRC:%.c=$(OUT)/%.o) $(OUT)/embed.o $(EPD:%=$(OUT)/epd_%.o)
 
 all: $(OUT)/sirius
 
-$(OUT)/sirius: $(OBJ)
-	$(CC) -o $@ $(OBJ) $(LDLIBS) -Wl,-z,relro,-z,now -s
+$(OUT)/sirius: $(OBJ) $(wildcard $(DEPS)/lib/*.a)
+	$(CC) -o $@ $(OBJ) $(LDLIBS) -Wl,-z,relro,-z,now -rdynamic -s
 	@$(OBJDUMP) -T $@ | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n -u | tail -n 1 | { read v; \
 	  echo "$@: needs $${v:-no glibc symbols} at most, $$(du -h $@ | cut -f1)"; \
 	  [ "$(ARCH)" != aarch64 ] || [ "$${v#GLIBC_2.}" -le $(MAX_GLIBC) ] || { echo "error: needs newer than glibc 2.$(MAX_GLIBC)"; exit 1; }; }
@@ -67,10 +67,15 @@ $(OUT):
 
 # The diary's local key is made once and kept: recordings made with one build can only be read by a build
 # with the same localkey.h. `make clean` leaves it alone; delete it by hand to start over.
+# LOCAL_KEY_HEX=<64 hex digits> uses that key instead of a random one (so builds made in different places agree).
 localkey.h:
 	@echo "making a new local key in localkey.h - keep this file"
 	@umask 077; { echo "static const unsigned char LOCAL_KEY[32] = {"; \
-	    head -c 32 /dev/urandom | od -An -v -tx1 | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1, /g'; echo "};"; } > localkey.h
+	    if [ -n "$(LOCAL_KEY_HEX)" ]; then \
+	        [ $$(printf %s "$(LOCAL_KEY_HEX)" | wc -c) = 64 ] || { echo "LOCAL_KEY_HEX must be 64 hex digits" >&2; exit 1; }; \
+	        printf %s "$(LOCAL_KEY_HEX)" | sed 's/\([0-9a-fA-F][0-9a-fA-F]\)/0x\1, /g'; \
+	    else head -c 32 /dev/urandom | od -An -v -tx1 | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1, /g'; fi; \
+	    echo "};"; } > localkey.h.tmp && mv localkey.h.tmp localkey.h
 
 clean:
 	rm -rf build

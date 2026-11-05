@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,7 @@ DiaryW *diary_create(const char *path) {
     if (!w) errx(1, "out of memory");
     w->fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (w->fd < 0) err(1, "%s", path);
+    flock(w->fd, LOCK_EX | LOCK_NB);                /* held while this file is being written (see diary_in_use) */
     w->path = strdup(path);
     unsigned char header[HEADER_BYTES];
     crypto_secretstream_xchacha20poly1305_init_push(&w->st, header, LOCAL_KEY);
@@ -161,7 +163,12 @@ static int cat_fd(const char *path, int fd, int out_fd) {
             warnx("%s: damaged data after %llu bytes", path, total);
             return 4;
         }
-        write_full(out_fd, plain, (size_t)plen);
+        for (size_t off = 0; off < plen;) {         /* the reader may go away: report it instead of exiting */
+            ssize_t w = write(out_fd, plain + off, (size_t)plen - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0) return 5;
+            off += (size_t)w;
+        }
         total += plen;
         if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) return 0;
     }
@@ -182,4 +189,12 @@ int diary_main(int argc, char **argv) {
     fprintf(stderr, "usage: %s rec FILE   (raw 16 kHz mono 16-bit PCM on stdin)\n"
                     "       %s cat FILE   (decrypted PCM on stdout)\n", argv[0], argv[0]);
     return 2;
+}
+
+int diary_in_use(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int busy = flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    close(fd);                                      /* (this also drops our own lock if we got it) */
+    return busy;
 }

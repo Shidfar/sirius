@@ -8,3 +8,4 @@
 /ort/
 /models/*
 !/models/gigaam_v3.onnx
+/localkey.h.tmp
