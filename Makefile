@@ -20,7 +20,17 @@ epdtext: epdtext.c font8x16.h
 preview: epdtext.c font8x16.h
 	$(CC) $(CFLAGS) epdtext.c -o epdtext-preview
 
+# The diary's local key is made once and kept: recordings made with one build can only be read by a build
+# with the same localkey.h. `make clean` leaves it alone; delete it by hand to start over.
+localkey.h:
+	@echo "making a new local key in localkey.h - keep this file"
+	@umask 077; { echo "static const unsigned char LOCAL_KEY[32] = {"; \
+	    head -c 32 /dev/urandom | od -An -v -tx1 | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1, /g'; echo "};"; } > localkey.h
+
+diary: diary.c localkey.h
+	$(CC) $(CFLAGS) diary.c -o diary -lsodium
+
 clean:
-	rm -f gigaam epdtext epdtext-preview epdtext.o
+	rm -f gigaam epdtext epdtext-preview epdtext.o diary diaryd
 
 .PHONY: clean preview

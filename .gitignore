@@ -2,7 +2,11 @@
 /gigaam
 /epdtext
 /epdtext-preview
+/diary
+/diaryd
 *.o
+# the diary's local key: never commit it
+/localkey.h
 # downloaded by ./fetch.sh
 /ort/
 /models/*
