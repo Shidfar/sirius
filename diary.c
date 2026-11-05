@@ -1,10 +1,11 @@
 /*
  * diary.c - encrypted local storage for voice diary recordings.
  *
- *   diary rec FILE    read raw PCM from stdin and write it, encrypted, to FILE while it arrives
- *   diary cat FILE    decrypt FILE to stdout
+ *   sirius diary rec FILE    read raw PCM from stdin and write it, encrypted, to FILE while it arrives
+ *   sirius diary cat FILE    decrypt FILE to stdout
+ * and, for the rest of the program, diary.h (diary_create / diary_write / diary_finish / diary_cat).
  *
- * Exit codes of `diary cat`: 0 complete, 3 cut short (a power cut: everything up to the last complete
+ * Exit codes of `diary cat` (and the return value of diary_cat): 0 complete, 3 cut short (a power cut: everything up to the last complete
  * chunk was written to stdout), 4 a chunk failed authentication (damaged or tampered file).
  *
  * The key is compiled into the program (localkey.h, made by `make`). It is only a speed bump for someone
@@ -29,6 +30,7 @@
 
 #include <sodium.h>
 
+#include "diary.h"
 #include "localkey.h"
 
 #define MAGIC "SIRD1\n"
@@ -66,47 +68,83 @@ static void write_full(int fd, const unsigned char *buf, size_t n) {
     }
 }
 
+/* ------------------------------------------------------------- writer -- */
+
+struct DiaryW {
+    int fd;
+    char *path;
+    crypto_secretstream_xchacha20poly1305_state st;
+    unsigned char plain[CHUNK];
+    size_t fill;
+};
+
+DiaryW *diary_create(const char *path) {
+    DiaryW *w = calloc(1, sizeof *w);
+    if (!w) errx(1, "out of memory");
+    w->fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (w->fd < 0) err(1, "%s", path);
+    w->path = strdup(path);
+    unsigned char header[HEADER_BYTES];
+    crypto_secretstream_xchacha20poly1305_init_push(&w->st, header, LOCAL_KEY);
+    write_full(w->fd, (const unsigned char *)MAGIC, MAGIC_LEN);
+    write_full(w->fd, header, sizeof header);
+    fdatasync(w->fd);
+    return w;
+}
+
+static void push_chunk(DiaryW *w, int final) {
+    unsigned char cipher[CHUNK + ABYTES + 4];
+    unsigned long long clen;
+    crypto_secretstream_xchacha20poly1305_push(&w->st, cipher + 4, &clen, w->plain, w->fill, NULL, 0,
+        final ? crypto_secretstream_xchacha20poly1305_TAG_FINAL : crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
+    for (int i = 0; i < 4; i++) cipher[i] = (unsigned char)(clen >> (8 * i));
+    write_full(w->fd, cipher, 4 + (size_t)clen);
+    fdatasync(w->fd);                               /* at most one second of audio is lost in a power cut */
+    w->fill = 0;
+}
+
+void diary_write(DiaryW *w, const void *pcm, size_t n) {
+    const unsigned char *p = pcm;
+    while (n) {
+        size_t take = CHUNK - w->fill < n ? CHUNK - w->fill : n;
+        memcpy(w->plain + w->fill, p, take);
+        w->fill += take; p += take; n -= take;
+        if (w->fill == CHUNK) push_chunk(w, 0);
+    }
+}
+
+void diary_finish(DiaryW *w) {
+    push_chunk(w, 1);
+    if (close(w->fd)) err(1, "%s", w->path);
+    sodium_memzero(w->plain, sizeof w->plain);
+    free(w->path);
+    free(w);
+}
+
 static int cmd_rec(const char *path) {
     struct sigaction sa = {.sa_handler = on_signal};  /* no SA_RESTART: a signal interrupts read() */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) err(1, "%s", path);
-
-    crypto_secretstream_xchacha20poly1305_state st;
-    unsigned char header[HEADER_BYTES];
-    crypto_secretstream_xchacha20poly1305_init_push(&st, header, LOCAL_KEY);
-    write_full(fd, (const unsigned char *)MAGIC, MAGIC_LEN);
-    write_full(fd, header, sizeof header);
-    fdatasync(fd);
-
-    unsigned char plain[CHUNK], cipher[CHUNK + ABYTES + 4];
-    for (int last = 0; !last;) {
-        size_t n = read_full(STDIN_FILENO, plain, CHUNK);
-        last = n < CHUNK || stop;                   /* a short chunk means end of input (or a stop signal) */
-        unsigned long long clen;
-        crypto_secretstream_xchacha20poly1305_push(&st, cipher + 4, &clen, plain, n, NULL, 0,
-            last ? crypto_secretstream_xchacha20poly1305_TAG_FINAL : crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
-        for (int i = 0; i < 4; i++) cipher[i] = (unsigned char)(clen >> (8 * i));
-        write_full(fd, cipher, 4 + (size_t)clen);
-        fdatasync(fd);                              /* at most one second of audio is lost in a power cut */
+    DiaryW *w = diary_create(path);
+    unsigned char buf[CHUNK];
+    for (;;) {
+        size_t n = read_full(STDIN_FILENO, buf, CHUNK);
+        diary_write(w, buf, n);
+        if (n < CHUNK || stop) break;               /* a short read means end of input (or a stop signal) */
     }
-    if (close(fd)) err(1, "%s", path);
-    sodium_memzero(plain, sizeof plain);
+    diary_finish(w);
+    sodium_memzero(buf, sizeof buf);
     return 0;
 }
 
-static int cmd_cat(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) err(1, "%s", path);
-
+static int cat_fd(const char *path, int fd, int out_fd) {
     unsigned char magic[MAGIC_LEN], header[HEADER_BYTES];
     if (read_full(fd, magic, MAGIC_LEN) != MAGIC_LEN || memcmp(magic, MAGIC, MAGIC_LEN) ||
         read_full(fd, header, sizeof header) != sizeof header)
-        errx(1, "%s: not a diary file", path);
+        { warnx("%s: not a diary file", path); return 1; }
     crypto_secretstream_xchacha20poly1305_state st;
-    if (crypto_secretstream_xchacha20poly1305_init_pull(&st, header, LOCAL_KEY) != 0) errx(1, "%s: bad header", path);
+    if (crypto_secretstream_xchacha20poly1305_init_pull(&st, header, LOCAL_KEY) != 0) { warnx("%s: bad header", path); return 1; }
 
     unsigned char cipher[CHUNK + ABYTES], plain[CHUNK], len4[4];
     unsigned long long total = 0;
@@ -123,17 +161,25 @@ static int cmd_cat(const char *path) {
             warnx("%s: damaged data after %llu bytes", path, total);
             return 4;
         }
-        write_full(STDOUT_FILENO, plain, (size_t)plen);
+        write_full(out_fd, plain, (size_t)plen);
         total += plen;
         if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) return 0;
     }
 }
 
-int main(int argc, char **argv) {
+int diary_cat(const char *path, int out_fd) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { warn("%s", path); return 1; }
+    int rc = cat_fd(path, fd, out_fd);
+    close(fd);
+    return rc;
+}
+
+int diary_main(int argc, char **argv) {
     if (sodium_init() < 0) errx(1, "cannot initialise libsodium");
     if (argc == 3 && !strcmp(argv[1], "rec")) return cmd_rec(argv[2]);
-    if (argc == 3 && !strcmp(argv[1], "cat")) return cmd_cat(argv[2]);
-    fprintf(stderr, "usage: diary rec FILE   (raw 16 kHz mono 16-bit PCM on stdin)\n"
-                    "       diary cat FILE   (decrypted PCM on stdout)\n");
+    if (argc == 3 && !strcmp(argv[1], "cat")) return diary_cat(argv[2], STDOUT_FILENO);
+    fprintf(stderr, "usage: %s rec FILE   (raw 16 kHz mono 16-bit PCM on stdin)\n"
+                    "       %s cat FILE   (decrypted PCM on stdout)\n", argv[0], argv[0]);
     return 2;
 }

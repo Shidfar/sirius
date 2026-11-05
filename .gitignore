@@ -1,13 +1,10 @@
-# built binaries
-/gigaam
-/epdtext
-/epdtext-preview
-/diary
-/diaryd
-*.o
+# build output
+/build/
 # the diary's local key: never commit it
 /localkey.h
-# downloaded by ./fetch.sh
+# static libraries and their sources, made by ./deps.sh
+/deps/
+# ONNX Runtime and the speech models, downloaded by ./fetch.sh (they get built into the binary)
 /ort/
 /models/*
 !/models/gigaam_v3.onnx

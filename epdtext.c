@@ -315,7 +315,7 @@ static void usage(void) {
     exit(2);
 }
 
-int main(int argc, char **argv) {
+int epdtext_main(int argc, char **argv) {
     const char *preview_path = NULL;
     double interval = 180, timeout = 60;
     int loop = 0, i = 1;
@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
         else usage();
     }
 #ifndef HAVE_EPD
-    if (!preview_path) errx(1, "built without display support: use -p FILE, or build with 'make epdtext'");
+    if (!preview_path) errx(1, "built without display support: use -p FILE, or build with HAVE_EPD (the Pi build)");
 #endif
     if (loop) {
         if (i < argc) usage();                                /* loop mode takes its text from stdin */
