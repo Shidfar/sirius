@@ -1,4 +1,6 @@
-# Builds the single Raspberry Pi binary (arm64) on GitHub, so no Linux PC is needed. Start it by hand:
+# Builds the single Raspberry Pi binary (arm64) on GitHub, so no Linux PC is needed. Use it only in a PRIVATE
+# repository: the artifact contains the local key, and anyone who can read the repository can download it.
+# Start it by hand:
 # Actions tab -> "Build the Pi binary" -> Run workflow. The result is the artifact "sirius-aarch64".
 #
 # Optional repository secret SIRIUS_LOCAL_KEY (64 hex digits, e.g. `openssl rand -hex 32`): the key built into the

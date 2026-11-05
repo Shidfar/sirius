@@ -47,7 +47,7 @@ What the bucket does show: when entries were made and how long they are (file na
 
 The Pi build is made on another machine (it is 250 MB because the speech model is inside).
 
-- **On GitHub, no Linux needed:** Actions tab -> "Build the Pi binary" -> Run workflow, then download the artifact `sirius-aarch64`, unzip it. (Optional repository secret `SIRIUS_LOCAL_KEY`, 64 hex digits from `openssl rand -hex 32`, makes every build use the same local key.)
+- **On GitHub, no Linux needed** (only for a *private* repository: the downloadable file contains the local key): Actions tab -> "Build the Pi binary" -> Run workflow, then download the artifact `sirius-aarch64`, unzip it. (Optional repository secret `SIRIUS_LOCAL_KEY`, 64 hex digits from `openssl rand -hex 32`, makes every build use the same local key.)
 - **On a Linux PC** (also WSL):
   ```bash
   sudo apt install gcc-aarch64-linux-gnu cmake make curl unzip xz-utils bzip2
