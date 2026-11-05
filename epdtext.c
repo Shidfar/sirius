@@ -1,0 +1,224 @@
+/*
+ * epdtext.c - show UTF-8 text on a Waveshare 2.13" e-Paper HAT (V4, 250x122, black/white).
+ *
+ * usage: epdtext [-r] [-p out.pbm] [--] [text ...]      (reads stdin when no text is given)
+ *   -r         turn the picture by 180 degrees (use it if the text appears upside down)
+ *   -p FILE    write a preview image (PBM) of what would be shown, and leave the display alone
+ *
+ * The text is word-wrapped into 30 columns x 7 rows of 8x16 glyphs (Latin and Cyrillic). If it does not
+ * fit, the oldest words are dropped and a leading "…" marks the cut.
+ *
+ * Built with -DHAVE_EPD it drives the panel through Waveshare's C driver (lgpio backend); without it only
+ * -p works ("make preview").
+ */
+#define _POSIX_C_SOURCE 200809L
+#include <err.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef HAVE_EPD
+#include "DEV_Config.h"
+#include "EPD_2in13_V4.h"
+#endif
+
+#include "font8x16.h"
+
+#define PANEL_W 122                         /* the panel's native (portrait) size */
+#define PANEL_H 250
+#define ROW_BYTES ((PANEL_W + 7) / 8)
+#define W PANEL_H                           /* the picture we draw is landscape */
+#define H PANEL_W
+#define GLYPH_W 8
+#define GLYPH_H 16
+#define COLS 30
+#define ROWS 7
+#define MARGIN_X ((W - COLS * GLYPH_W) / 2)
+#define MARGIN_Y ((H - ROWS * GLYPH_H) / 2)
+#define ELLIPSIS 0x2026
+#define MAX_INPUT (64 * 1024)
+
+_Static_assert(MARGIN_X >= 0 && MARGIN_Y >= 0, "text area larger than the picture");
+
+static uint8_t panel[ROW_BYTES * PANEL_H];  /* what the driver gets: 1 bit per pixel, 1 = white */
+static uint8_t preview[H][W];               /* the same picture, landscape, 1 = black */
+static int flip;
+
+/* ------------------------------------------------------------- drawing -- */
+
+/* Blackens pixel (x, y) of the landscape picture. The mapping onto the panel's native layout is the same
+ * as Waveshare's Python driver uses for landscape images (a 90-degree turn); -r turns it by 180 degrees. */
+static void set_black(int x, int y) {
+    int nx = flip ? PANEL_W - 1 - y : y;
+    int ny = flip ? x : PANEL_H - 1 - x;
+    panel[ny * ROW_BYTES + nx / 8] &= (uint8_t)~(0x80 >> (nx % 8));
+    preview[y][x] = 1;
+}
+
+static const uint8_t *glyph(uint32_t cp) {
+    for (int pass = 0; pass < 2; pass++) {      /* second pass: fall back to '?' */
+        int lo = 0, hi = FONT_N - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (FONT_CP[mid] == cp) return FONT_BITS[mid];
+            if (FONT_CP[mid] < cp) lo = mid + 1; else hi = mid - 1;
+        }
+        cp = '?';
+    }
+    return FONT_BITS[0];
+}
+
+static void draw_glyph(int col, int row, uint32_t cp) {
+    const uint8_t *g = glyph(cp);
+    for (int y = 0; y < GLYPH_H; y++)
+        for (int x = 0; x < GLYPH_W; x++)
+            if (g[y] & (0x80 >> x)) set_black(MARGIN_X + col * GLYPH_W + x, MARGIN_Y + row * GLYPH_H + y);
+}
+
+/* ---------------------------------------------------------------- text -- */
+
+static uint32_t utf8_next(const unsigned char **p) {
+    const unsigned char *s = *p;
+    uint32_t cp;
+    int n;
+    if (s[0] < 0x80) { cp = s[0]; n = 1; }
+    else if ((s[0] & 0xE0) == 0xC0) { cp = s[0] & 0x1F; n = 2; }
+    else if ((s[0] & 0xF0) == 0xE0) { cp = s[0] & 0x0F; n = 3; }
+    else if ((s[0] & 0xF8) == 0xF0) { cp = s[0] & 0x07; n = 4; }
+    else { *p = s + 1; return 0xFFFD; }
+    for (int i = 1; i < n; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *p = s + i; return 0xFFFD; }   /* also stops at the terminating NUL */
+        cp = cp << 6 | (s[i] & 0x3F);
+    }
+    *p = s + n;
+    return cp;
+}
+
+typedef struct { const uint32_t *cp; int n; } Word;
+typedef struct { uint32_t cp[COLS]; int n; } Line;
+
+/* Wraps words[first..] (preceded by "…" when first > 0) into lines. Returns the number of lines used,
+ * or ROWS + 1 as soon as the text would not fit. Words longer than a line are broken. */
+static int layout(const Word *words, int nwords, int first, Line *lines) {
+    static const uint32_t ellipsis[1] = {ELLIPSIS};
+    int nl = 1;
+    lines[0].n = 0;
+    for (int k = first > 0 ? first - 1 : 0; k < nwords; k++) {
+        Word w = k < first ? (Word){ellipsis, 1} : words[k];
+        for (int off = 0; off < w.n;) {
+            int len = w.n - off > COLS ? COLS : w.n - off;
+            Line *l = &lines[nl - 1];
+            if (l->n && l->n + 1 + len > COLS) {
+                if (nl == ROWS) return ROWS + 1;
+                l = &lines[nl++];
+                l->n = 0;
+            }
+            if (l->n) l->cp[l->n++] = ' ';
+            memcpy(l->cp + l->n, w.cp + off, len * sizeof *w.cp);
+            l->n += len;
+            off += len;
+        }
+    }
+    return nl;
+}
+
+static void render_text(const char *text) {
+    size_t cap = strlen(text) + 1;
+    uint32_t *cps = malloc(cap * sizeof *cps);
+    Word *words = malloc(cap * sizeof *words);
+    if (!cps || !words) errx(1, "out of memory");
+
+    int ncp = 0, nwords = 0, in_word = 0;           /* split into whitespace-separated words */
+    for (const unsigned char *p = (const unsigned char *)text; *p;) {
+        uint32_t cp = utf8_next(&p);
+        if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == 0xA0) { in_word = 0; continue; }
+        if (!in_word) { words[nwords++] = (Word){cps + ncp, 0}; in_word = 1; }
+        cps[ncp++] = cp;
+        words[nwords - 1].n++;
+    }
+
+    Line lines[ROWS];
+    int first = 0, nl;
+    while ((nl = layout(words, nwords, first, lines)) > ROWS) first++;   /* drop the oldest word until it fits */
+
+    for (int r = 0; r < nl; r++)
+        for (int c = 0; c < lines[r].n; c++) draw_glyph(c, r, lines[r].cp[c]);
+    free(cps);
+    free(words);
+}
+
+static char *read_stdin(void) {
+    char *buf = malloc(MAX_INPUT + 1);
+    if (!buf) errx(1, "out of memory");
+    size_t n = fread(buf, 1, MAX_INPUT, stdin);
+    buf[n] = 0;
+    return buf;
+}
+
+/* -------------------------------------------------------------- output -- */
+
+static void write_preview(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) err(1, "%s", path);
+    fprintf(f, "P4\n%d %d\n", W, H);
+    for (int y = 0; y < H; y++) {
+        uint8_t row[(W + 7) / 8] = {0};
+        for (int x = 0; x < W; x++) if (preview[y][x]) row[x / 8] |= (uint8_t)(0x80 >> (x % 8));
+        fwrite(row, 1, sizeof row, f);
+    }
+    if (fclose(f)) err(1, "%s", path);
+}
+
+#ifdef HAVE_EPD
+static void show(void) {
+    if (DEV_Module_Init() != 0) errx(1, "cannot open the GPIO/SPI interface (is SPI enabled? try sudo)");
+    EPD_2in13_V4_Init();
+    EPD_2in13_V4_Display(panel);
+    EPD_2in13_V4_Sleep();           /* keeps the picture, uses no power */
+    DEV_Module_Exit();
+}
+#endif
+
+static void usage(void) {
+    fprintf(stderr, "usage: epdtext [-r] [-p out.pbm] [--] [text ...]\n"
+                    "  shows text on the e-Paper display (reads stdin when no text is given)\n"
+                    "  -r       turn the picture by 180 degrees\n"
+                    "  -p FILE  write a preview image instead of using the display\n");
+    exit(2);
+}
+
+int main(int argc, char **argv) {
+    const char *preview_path = NULL;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "-r")) flip = 1;
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) preview_path = argv[++i];
+        else if (!strcmp(argv[i], "--")) { i++; break; }
+        else usage();
+    }
+
+    char *text;
+    if (i < argc) {                                       /* text on the command line */
+        size_t len = 1;
+        for (int k = i; k < argc; k++) len += strlen(argv[k]) + 1;
+        text = malloc(len);
+        if (!text) errx(1, "out of memory");
+        text[0] = 0;
+        for (int k = i; k < argc; k++) { if (k > i) strcat(text, " "); strcat(text, argv[k]); }
+    } else {
+        text = read_stdin();
+    }
+
+    memset(panel, 0xFF, sizeof panel);
+    render_text(text);
+    free(text);
+
+    if (preview_path) write_preview(preview_path);
+#ifdef HAVE_EPD
+    else show();
+#else
+    else errx(1, "built without display support: use -p FILE, or build with 'make epdtext'");
+#endif
+    return 0;
+}
