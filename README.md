@@ -34,7 +34,9 @@ least one refresh every 24 hours; `epdtext` puts the panel to sleep after each u
 
 `epdtext -l` (loop mode) reads lines from stdin and adds each one to the text on the screen. It refreshes when
 new text has arrived, at most once every `-i` seconds (default 180), so lines that arrive in between are shown
-together.
+together. Each update runs in its own process, because Waveshare's lgpio backend hangs if it is started twice in
+one process; an update that takes longer than `-t` seconds (default 60) is abandoned and the loop goes on.
+After the panel is put to sleep, `epdtext` waits 2 s and then cuts its power, as the Waveshare demo asks.
 
 ## Listening: microphone to screen
 

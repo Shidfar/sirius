@@ -2,9 +2,10 @@
  * epdtext.c - show UTF-8 text on a Waveshare 2.13" e-Paper HAT (V4, 250x122, black/white).
  *
  * usage: epdtext [-r] [-p out.pbm] [--] [text ...]      (reads stdin when no text is given)
- *        epdtext -l [-i seconds] [-r] [-p out.pbm]       (loop mode)
+ *        epdtext -l [-i seconds] [-t seconds] [-r] [-p out.pbm]       (loop mode)
  *   -l         loop: every line read from stdin is added to the text on the screen; the screen is refreshed
- *              when new text has arrived, at most once every -i seconds (default 180, Waveshare's advice)
+ *              when new text has arrived, at most once every -i seconds (default 180, Waveshare's advice).
+ *              Every update runs in its own process and is abandoned after -t seconds (default 60).
  *   -r         turn the picture by 180 degrees (use it if the text appears upside down)
  *   -p FILE    write a preview image (PBM) of what would be shown, and leave the display alone
  *
@@ -18,10 +19,12 @@
 #include <err.h>
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -179,20 +182,70 @@ static void write_preview(const char *path) {
     if (fclose(f)) err(1, "%s", path);
 }
 
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static void sleep_s(double s) {
+    if (s <= 0) return;
+    struct timespec ts = {(time_t)s, (long)((s - (time_t)s) * 1e9)};
+    nanosleep(&ts, NULL);
+}
+
 #ifdef HAVE_EPD
+/* Sends the picture to the panel: power up, update, sleep, power down. */
 static void show(void) {
     if (DEV_Module_Init() != 0) errx(1, "cannot open the GPIO/SPI interface (is SPI enabled? try sudo)");
     EPD_2in13_V4_Init();
     EPD_2in13_V4_Display(panel);
     EPD_2in13_V4_Sleep();           /* keeps the picture, uses no power */
+    DEV_Delay_ms(2000);             /* Waveshare: "important, at least 2s" between sleep and power-off */
     DEV_Module_Exit();
+#ifdef USE_LGPIO_LIB
+    /* With the lgpio backend Waveshare's Exit() does nothing; cut the panel's power as their Python driver does */
+    DEV_Digital_Write(EPD_RST_PIN, 0);
+    DEV_Digital_Write(EPD_DC_PIN, 0);
+    DEV_Digital_Write(EPD_PWR_PIN, 0);
+#endif
+}
+
+/* One update in a process of its own. Waveshare's lgpio backend cannot be started twice in one process (the
+ * second DEV_Module_Init leaves the BUSY line unclaimed and the busy-wait never ends), and a child process
+ * can be abandoned if the panel stops answering. */
+static void show_in_child(double timeout) {
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) err(1, "fork");
+    if (pid == 0) {
+        show();
+        fflush(NULL);
+        _exit(0);
+    }
+    for (double deadline = now_s() + timeout;; sleep_s(0.1)) {
+        int status;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            if (!WIFEXITED(status) || WEXITSTATUS(status)) warnx("display update failed");
+            return;
+        }
+        if (now_s() > deadline) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            warnx("the display did not answer within %.0f s; skipping this update", timeout);
+            return;
+        }
+    }
 }
 #endif
 
-static void refresh(const char *text, const char *preview_path) {
+/* Draws `text` and shows it. A positive `timeout` (loop mode) runs the display update in a child process. */
+static void refresh(const char *text, const char *preview_path, double timeout) {
+    (void)timeout;
     render_text(text);
     if (preview_path) write_preview(preview_path);
 #ifdef HAVE_EPD
+    else if (timeout > 0) show_in_child(timeout);
     else show();
 #endif
 }
@@ -202,12 +255,6 @@ static void refresh(const char *text, const char *preview_path) {
 /* Each line read from stdin is added to the text on the screen. The screen is refreshed when new text has
  * arrived, but at most once every `interval` seconds: lines that arrive in between are shown together. */
 #define MAX_HISTORY 4096                /* the screen shows ~200 characters; keep far more than that */
-
-static double now_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
 
 /* Appends input bytes to the history; a newline ends a line and marks the screen as out of date. */
 static void absorb(char *hist, size_t *len, const char *in, size_t n, int *dirty) {
@@ -228,7 +275,7 @@ static void absorb(char *hist, size_t *len, const char *in, size_t n, int *dirty
     }
 }
 
-static void run_loop(double interval, const char *preview_path) {
+static void run_loop(double interval, const char *preview_path, double timeout) {
     char hist[2 * MAX_HISTORY + 1], buf[1024];
     size_t len = 0;
     double last = -1e18;                                     /* time of the last refresh */
@@ -237,12 +284,11 @@ static void run_loop(double interval, const char *preview_path) {
         double wait = dirty ? last + interval - now_s() : -1;
         if (dirty && wait <= 0) {
             hist[len] = 0;
-            refresh(hist, preview_path);
+            refresh(hist, preview_path, timeout);
             last = now_s();
             dirty = 0;
         } else if (eof) {                                    /* input is over: wait out the interval, then show the rest */
-            struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
-            nanosleep(&ts, NULL);
+            sleep_s(wait);
         } else {
             struct pollfd p = {STDIN_FILENO, POLLIN, 0};
             if (poll(&p, 1, wait < 0 ? -1 : (int)(wait * 1000) + 1) <= 0) continue;
@@ -259,10 +305,11 @@ static void run_loop(double interval, const char *preview_path) {
 
 static void usage(void) {
     fprintf(stderr, "usage: epdtext [-r] [-p out.pbm] [--] [text ...]\n"
-                    "       epdtext -l [-i seconds] [-r] [-p out.pbm]\n"
+                    "       epdtext -l [-i seconds] [-t seconds] [-r] [-p out.pbm]\n"
                     "  shows text on the e-Paper display (reads stdin when no text is given)\n"
                     "  -l       loop: add every line read from stdin to the text on the screen\n"
                     "  -i SEC   loop mode: refresh at most every SEC seconds (default 180, Waveshare's advice)\n"
+                    "  -t SEC   loop mode: give up on a display update that takes longer than SEC seconds (default 60)\n"
                     "  -r       turn the picture by 180 degrees\n"
                     "  -p FILE  write a preview image instead of using the display\n");
     exit(2);
@@ -270,12 +317,13 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
     const char *preview_path = NULL;
-    double interval = 180;
+    double interval = 180, timeout = 60;
     int loop = 0, i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         if (!strcmp(argv[i], "-r")) flip = 1;
         else if (!strcmp(argv[i], "-l")) loop = 1;
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) timeout = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) preview_path = argv[++i];
         else if (!strcmp(argv[i], "--")) { i++; break; }
         else usage();
@@ -285,7 +333,7 @@ int main(int argc, char **argv) {
 #endif
     if (loop) {
         if (i < argc) usage();                                /* loop mode takes its text from stdin */
-        run_loop(interval > 0 ? interval : 0, preview_path);
+        run_loop(interval > 0 ? interval : 0, preview_path, timeout > 0 ? timeout : 60);
         return 0;
     }
 
@@ -301,7 +349,7 @@ int main(int argc, char **argv) {
         text = read_stdin();
     }
 
-    refresh(text, preview_path);
+    refresh(text, preview_path, 0);
     free(text);
     return 0;
 }
