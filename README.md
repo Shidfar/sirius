@@ -32,12 +32,34 @@ If the text is upside down, add `-r`. `make preview` builds the same renderer wi
 writes the picture to a file instead of the display. Waveshare asks for at least 180 s between refreshes and at
 least one refresh every 24 hours; `epdtext` puts the panel to sleep after each update.
 
+`epdtext -l` (loop mode) reads lines from stdin and adds each one to the text on the screen. It refreshes when
+new text has arrived, at most once every `-i` seconds (default 180), so lines that arrive in between are shown
+together.
+
+## Listening: microphone to screen
+
+`gigaam -s` is the stream mode: it reads raw 16 kHz mono 16-bit PCM from stdin (for example from `arecord`),
+loads the model once, finds utterances with a simple energy gate and prints one line of text per utterance.
+`-g LEVEL` sets the speech level (default 0.005 of full scale); the gate rises by itself in a noisy room.
+Pauses longer than 0.7 s end an utterance.
+
+```bash
+arecord -q -D plughw:1,0 -f S16_LE -r 16000 -c 1 -t raw | ./gigaam -s -v    # see `arecord -l` for the card number
+./listen.sh                        # microphone -> gigaam -s -> epdtext -l
+./listen.sh --file recording.wav   # the same chain with a recording (no microphone needed)
+```
+
+`listen.sh` reads `MIC` (sound card, default `plughw:1,0`), `INTERVAL` (screen refresh interval, default 180)
+and `GATE` from the environment. The microphone should be a USB one: the e-Paper HAT switches its power on
+GPIO 18, which is also the I2S clock pin.
+
 ## Files
 
 | File | What it is |
 |---|---|
-| `gigaam.c` | The whole program: WAV reader, ONNX Runtime calls, greedy RNN-T decoder, text cleanup, chunking |
-| `epdtext.c` | Text-to-panel program: word wrap, 8x16 glyph drawing, Waveshare driver calls |
+| `gigaam.c` | The whole program: WAV reader, ONNX Runtime calls, greedy RNN-T decoder, text cleanup, chunking, stream mode |
+| `epdtext.c` | Text-to-panel program: word wrap, 8x16 glyph drawing, Waveshare driver calls, loop mode |
+| `listen.sh` | Chains `arecord` (or `ffmpeg` for a file), `gigaam -s` and `epdtext -l` |
 | `font8x16.h` | Glyph table generated from [Terminus Font](https://terminus-font.sourceforge.net/) 4.48 (SIL OFL 1.1) |
 | `fetch.sh` | Downloads ONNX Runtime from NuGet (picks x64 or arm64) and the models from Hugging Face |
 | `models/gigaam_v3.onnx` | Log-mel feature extractor, taken from the [onnx-asr](https://github.com/istupakov/onnx-asr) package (MIT) |

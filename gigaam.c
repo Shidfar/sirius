@@ -7,9 +7,16 @@
  *   -> greedy RNN-T loop (decoder LSTM + joint network) -> text
  *
  * Long audio is cut into chunks at quiet points to bound memory use.
+ *
+ * Two ways to use it:
+ *   gigaam audio.wav          transcribe a WAV file and exit
+ *   gigaam -s < raw_pcm       stream mode: read raw 16 kHz mono 16-bit PCM from stdin (for example from
+ *                             arecord), load the model once, print one line of text per utterance
  */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <err.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -333,14 +340,124 @@ static size_t find_cut(const float *x, size_t start, size_t end, size_t search) 
     return best;
 }
 
+/* Transcribes pcm[0..n) in pieces of at most `chunk` samples, cut at quiet points, and writes the text to
+ * `out`. Returns the number of pieces. */
+static int transcribe_long(Engine *E, float *pcm, size_t n, size_t chunk, FILE *out) {
+    int nseg = 0, printed = 0;
+    for (size_t start = 0; start < n;) {
+        size_t end = start + chunk;
+        if (end >= n || n - end < SAMPLE_RATE) end = n;   /* don't leave a tiny tail */
+        else end = find_cut(pcm, start, end, (size_t)3 * SAMPLE_RATE);
+        if (end - start >= 400) {                          /* skip < 25 ms of audio */
+            char *txt = transcribe(E, pcm + start, end - start);
+            if (*txt) { fprintf(out, "%s%s", printed ? " " : "", txt); printed = 1; }
+            free(txt);
+            nseg++;
+        }
+        start = end;
+    }
+    return nseg;
+}
+
+/* ------------------------------------------------------- stream mode -- */
+
+#define FRAME 320               /* 20 ms of audio */
+#define PREROLL_FRAMES 15       /* audio kept from before the first loud frame (300 ms) */
+#define START_FRAMES 3          /* loud frames in a row that start an utterance */
+#define END_FRAMES 35           /* quiet frames in a row that end it (700 ms) */
+#define KEEP_QUIET_FRAMES 10    /* quiet audio kept after the last speech (200 ms) */
+#define MIN_FRAMES 15           /* shorter utterances are ignored (300 ms) */
+#define MAX_UTT_SEC 30          /* longer ones are cut here */
+#define NOISE_FRAMES 150        /* the background level is the quietest frame of the last 3 s */
+
+/* Reads one FRAME of samples from stdin. Returns 0 at the end of the input. */
+static int read_frame(int16_t *buf) {
+    size_t want = sizeof(int16_t) * FRAME, got = 0;
+    while (got < want) {
+        ssize_t r = read(STDIN_FILENO, (char *)buf + got, want - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return 0;
+        got += (size_t)r;
+    }
+    return 1;
+}
+
+/* Finds utterances in the PCM stream on stdin with a simple energy gate, transcribes each one and prints it
+ * as one line. `gate` is the speech level (RMS, 1 = full scale); the gate rises on its own in a noisy room. */
+static void stream_loop(Engine *E, size_t chunk, double gate, int verbose) {
+#ifdef F_SETPIPE_SZ
+    fcntl(STDIN_FILENO, F_SETPIPE_SZ, 1 << 20);   /* the pipe can hold ~30 s of audio while we transcribe */
+#endif
+    const size_t cap = (size_t)MAX_UTT_SEC * SAMPLE_RATE;
+    float *utt = xmalloc(cap * sizeof *utt), frame[FRAME];
+    int16_t raw[FRAME];
+    size_t n = 0;                                 /* samples in utt */
+    double recent[NOISE_FRAMES];                  /* mean-square energy of the last NOISE_FRAMES frames */
+    int in_utt = 0, loud_run = 0, quiet_run = 0, next = 0;
+    for (int i = 0; i < NOISE_FRAMES; i++) recent[i] = 1e9;
+
+    for (int more = 1; more;) {
+        int end_utt = 0;
+        more = read_frame(raw);
+        if (more) {
+            double e = 0, noise;
+            for (int i = 0; i < FRAME; i++) { frame[i] = raw[i] / 32768.0f; e += (double)frame[i] * frame[i]; }
+            e /= FRAME;
+            recent[next] = e;
+            next = (next + 1) % NOISE_FRAMES;
+            noise = recent[0];
+            for (int i = 1; i < NOISE_FRAMES; i++) if (recent[i] < noise) noise = recent[i];
+            int loud = e > (gate * gate > 9 * noise ? gate * gate : 9 * noise);   /* gate, or 3x the background */
+            if (!in_utt && n >= (size_t)PREROLL_FRAMES * FRAME) {   /* idle: keep just the last 300 ms */
+                memmove(utt, utt + FRAME, (n - FRAME) * sizeof *utt);
+                n -= FRAME;
+            }
+            memcpy(utt + n, frame, sizeof frame);
+            n += FRAME;
+            if (!in_utt) {
+                loud_run = loud ? loud_run + 1 : 0;
+                if (loud_run >= START_FRAMES) { in_utt = 1; quiet_run = 0; }
+            } else {
+                quiet_run = loud ? 0 : quiet_run + 1;
+                end_utt = quiet_run >= END_FRAMES || n + FRAME > cap;
+            }
+        } else {
+            end_utt = in_utt;                     /* end of input: transcribe what we have */
+        }
+        if (!end_utt) continue;
+
+        size_t len = n - (quiet_run > KEEP_QUIET_FRAMES ? quiet_run - KEEP_QUIET_FRAMES : 0) * FRAME;
+        if (len >= (size_t)MIN_FRAMES * FRAME) {
+            char *text = NULL;
+            size_t size = 0;
+            FILE *ms = open_memstream(&text, &size);
+            if (!ms) err(1, "open_memstream");
+            double t0 = now();
+            int nseg = transcribe_long(E, utt, len, chunk, ms);
+            fclose(ms);
+            if (size) { fwrite(text, 1, size, stdout); putchar('\n'); fflush(stdout); }
+            free(text);
+            if (verbose)
+                fprintf(stderr, "utterance %.1f s: transcribed in %.1f s (%d chunk(s))\n",
+                        (double)len / SAMPLE_RATE, now() - t0, nseg);
+        }
+        n = 0;
+        in_utt = loud_run = quiet_run = 0;
+    }
+    free(utt);
+}
+
 static void usage(const char *a0) {
     fprintf(stderr,
             "usage: %s [-m model_dir] [-t threads] [-c chunk_seconds] [-v] audio.wav\n"
+            "       %s -s [-g level] [-m model_dir] [-t threads] [-c chunk_seconds] [-v]\n"
             "  -m DIR   directory with the model files (default: ./models)\n"
             "  -t N     CPU threads (default: all cores)\n"
             "  -c SEC   max chunk length; longer audio is cut at quiet points (default 20, minimum 1, 0 = no chunking)\n"
+            "  -s       stream mode: read raw 16 kHz mono 16-bit PCM from stdin, print one line per utterance\n"
+            "  -g LEVEL speech level for stream mode, as a fraction of full scale (default 0.005)\n"
             "  -v       print timing and peak memory to stderr\n"
-            "audio.wav must be 16-bit PCM, mono, 16 kHz.\n", a0);
+            "audio.wav must be 16-bit PCM, mono, 16 kHz.\n", a0, a0);
 }
 
 int main(int argc, char **argv) {
@@ -350,43 +467,38 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD, 128 * 1024);
 #endif
     const char *model_dir = "models", *wav_path = NULL;
-    int threads = (int)sysconf(_SC_NPROCESSORS_ONLN), verbose = 0;
-    double chunk_sec = 20;
+    int threads = (int)sysconf(_SC_NPROCESSORS_ONLN), verbose = 0, stream = 0;
+    double chunk_sec = 20, gate = 0.005;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_dir = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) chunk_sec = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-g") && i + 1 < argc) gate = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-s")) stream = 1;
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (argv[i][0] == '-') { usage(argv[0]); return 2; }
         else wav_path = argv[i];
     }
-    if (!wav_path) { usage(argv[0]); return 2; }
+    if (stream == (wav_path != NULL) || gate <= 0) { usage(argv[0]); return 2; }   /* a file or -s, not both */
     if (threads < 1) threads = 1;
 
-    size_t n;
-    float *pcm = read_wav(wav_path, &n);
+    size_t n = 0;
+    float *pcm = stream ? NULL : read_wav(wav_path, &n);
     double t0 = now();
     Engine E = {0};
     engine_init(&E, model_dir, threads);
     double t_load = now() - t0;
 
-    size_t chunk = chunk_sec > 0 ? (size_t)(chunk_sec * SAMPLE_RATE) : n;
-    if (chunk < SAMPLE_RATE) chunk = SAMPLE_RATE;      /* guarantees the loop below makes progress */
-    size_t start = 0;
-    int nseg = 0, printed = 0;
-    t0 = now();
-    while (start < n) {
-        size_t end = start + chunk;
-        if (end >= n || n - end < SAMPLE_RATE) end = n;   /* don't leave a tiny tail */
-        else end = find_cut(pcm, start, end, (size_t)3 * SAMPLE_RATE);
-        if (end - start >= 400) {                          /* skip < 25 ms of audio */
-            char *txt = transcribe(&E, pcm + start, end - start);
-            if (*txt) { printf("%s%s", printed ? " " : "", txt); printed = 1; }
-            free(txt);
-            nseg++;
-        }
-        start = end;
+    size_t chunk = chunk_sec > 0 ? (size_t)(chunk_sec * SAMPLE_RATE) : (size_t)-1 / 2;
+    if (chunk < SAMPLE_RATE) chunk = SAMPLE_RATE;      /* guarantees the chunk loop makes progress */
+    if (stream) {
+        if (verbose) fprintf(stderr, "model loaded in %.1f s, listening on stdin\n", t_load);
+        stream_loop(&E, chunk, gate, verbose);
+        return 0;
     }
+
+    t0 = now();
+    int nseg = transcribe_long(&E, pcm, n, chunk, stdout);
     printf("\n");
     if (verbose) {
         struct rusage ru;

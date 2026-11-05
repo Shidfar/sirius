@@ -2,6 +2,9 @@
  * epdtext.c - show UTF-8 text on a Waveshare 2.13" e-Paper HAT (V4, 250x122, black/white).
  *
  * usage: epdtext [-r] [-p out.pbm] [--] [text ...]      (reads stdin when no text is given)
+ *        epdtext -l [-i seconds] [-r] [-p out.pbm]       (loop mode)
+ *   -l         loop: every line read from stdin is added to the text on the screen; the screen is refreshed
+ *              when new text has arrived, at most once every -i seconds (default 180, Waveshare's advice)
  *   -r         turn the picture by 180 degrees (use it if the text appears upside down)
  *   -p FILE    write a preview image (PBM) of what would be shown, and leave the display alone
  *
@@ -13,10 +16,14 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #include <err.h>
+#include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifdef HAVE_EPD
 #include "DEV_Config.h"
@@ -124,6 +131,8 @@ static int layout(const Word *words, int nwords, int first, Line *lines) {
 }
 
 static void render_text(const char *text) {
+    memset(panel, 0xFF, sizeof panel);              /* start from a white picture */
+    memset(preview, 0, sizeof preview);
     size_t cap = strlen(text) + 1;
     uint32_t *cps = malloc(cap * sizeof *cps);
     Word *words = malloc(cap * sizeof *words);
@@ -180,9 +189,80 @@ static void show(void) {
 }
 #endif
 
+static void refresh(const char *text, const char *preview_path) {
+    render_text(text);
+    if (preview_path) write_preview(preview_path);
+#ifdef HAVE_EPD
+    else show();
+#endif
+}
+
+/* ----------------------------------------------------------- loop mode -- */
+
+/* Each line read from stdin is added to the text on the screen. The screen is refreshed when new text has
+ * arrived, but at most once every `interval` seconds: lines that arrive in between are shown together. */
+#define MAX_HISTORY 4096                /* the screen shows ~200 characters; keep far more than that */
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Appends input bytes to the history; a newline ends a line and marks the screen as out of date. */
+static void absorb(char *hist, size_t *len, const char *in, size_t n, int *dirty) {
+    for (size_t i = 0; i < n; i++) {
+        if (*len >= 2 * MAX_HISTORY) {                       /* full: drop the oldest half, at a word boundary */
+            const char *sp = memchr(hist + MAX_HISTORY, ' ', *len - MAX_HISTORY);
+            size_t from = sp ? (size_t)(sp - hist) : MAX_HISTORY;
+            while (from < *len && (hist[from] & 0xC0) == 0x80) from++;   /* never start inside a UTF-8 character */
+            memmove(hist, hist + from, *len - from);
+            *len -= from;
+        }
+        if (in[i] == '\n') {
+            if (*len && hist[*len - 1] != ' ') hist[(*len)++] = ' ';
+            *dirty = 1;
+        } else {
+            hist[(*len)++] = in[i];
+        }
+    }
+}
+
+static void run_loop(double interval, const char *preview_path) {
+    char hist[2 * MAX_HISTORY + 1], buf[1024];
+    size_t len = 0;
+    double last = -1e18;                                     /* time of the last refresh */
+    int dirty = 0, eof = 0;
+    while (!eof || dirty) {
+        double wait = dirty ? last + interval - now_s() : -1;
+        if (dirty && wait <= 0) {
+            hist[len] = 0;
+            refresh(hist, preview_path);
+            last = now_s();
+            dirty = 0;
+        } else if (eof) {                                    /* input is over: wait out the interval, then show the rest */
+            struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
+            nanosleep(&ts, NULL);
+        } else {
+            struct pollfd p = {STDIN_FILENO, POLLIN, 0};
+            if (poll(&p, 1, wait < 0 ? -1 : (int)(wait * 1000) + 1) <= 0) continue;
+            ssize_t k = read(STDIN_FILENO, buf, sizeof buf);
+            if (k > 0) {
+                absorb(hist, &len, buf, (size_t)k, &dirty);
+            } else if (k == 0 || errno != EINTR) {
+                eof = 1;
+                if (len && hist[len - 1] != ' ') dirty = 1;  /* the last line had no newline */
+            }
+        }
+    }
+}
+
 static void usage(void) {
     fprintf(stderr, "usage: epdtext [-r] [-p out.pbm] [--] [text ...]\n"
+                    "       epdtext -l [-i seconds] [-r] [-p out.pbm]\n"
                     "  shows text on the e-Paper display (reads stdin when no text is given)\n"
+                    "  -l       loop: add every line read from stdin to the text on the screen\n"
+                    "  -i SEC   loop mode: refresh at most every SEC seconds (default 180, Waveshare's advice)\n"
                     "  -r       turn the picture by 180 degrees\n"
                     "  -p FILE  write a preview image instead of using the display\n");
     exit(2);
@@ -190,12 +270,23 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
     const char *preview_path = NULL;
-    int i = 1;
+    double interval = 180;
+    int loop = 0, i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         if (!strcmp(argv[i], "-r")) flip = 1;
+        else if (!strcmp(argv[i], "-l")) loop = 1;
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) preview_path = argv[++i];
         else if (!strcmp(argv[i], "--")) { i++; break; }
         else usage();
+    }
+#ifndef HAVE_EPD
+    if (!preview_path) errx(1, "built without display support: use -p FILE, or build with 'make epdtext'");
+#endif
+    if (loop) {
+        if (i < argc) usage();                                /* loop mode takes its text from stdin */
+        run_loop(interval > 0 ? interval : 0, preview_path);
+        return 0;
     }
 
     char *text;
@@ -210,15 +301,7 @@ int main(int argc, char **argv) {
         text = read_stdin();
     }
 
-    memset(panel, 0xFF, sizeof panel);
-    render_text(text);
+    refresh(text, preview_path);
     free(text);
-
-    if (preview_path) write_preview(preview_path);
-#ifdef HAVE_EPD
-    else show();
-#else
-    else errx(1, "built without display support: use -p FILE, or build with 'make epdtext'");
-#endif
     return 0;
 }
