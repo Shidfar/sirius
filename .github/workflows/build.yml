@@ -1,0 +1,38 @@
+# Builds the single Raspberry Pi binary (arm64) on GitHub, so no Linux PC is needed. Use it only in a PRIVATE
+# repository: the artifact contains the local key, and anyone who can read the repository can download it.
+# Start it by hand:
+# Actions tab -> "Build the Pi binary" -> Run workflow. The result is the artifact "sirius-aarch64".
+#
+# Optional repository secret SIRIUS_LOCAL_KEY (64 hex digits, e.g. `openssl rand -hex 32`): the key built into the
+# program to protect recordings until they are transcribed. With it, every build can read what any other build
+# recorded; without it each build gets its own random key.
+name: Build the Pi binary
+
+on:
+  workflow_dispatch:
+
+jobs:
+  aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu cmake make curl unzip xz-utils bzip2
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: deps/src
+          key: sirius-sources-${{ hashFiles('deps.sh', 'fetch.sh') }}
+      - name: Static libraries
+        run: ./deps.sh aarch64
+      - name: ONNX Runtime and models
+        run: ./fetch.sh aarch64
+      - name: Build
+        run: make ARCH=aarch64
+        env:
+          LOCAL_KEY_HEX: ${{ secrets.SIRIUS_LOCAL_KEY }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sirius-aarch64
+          path: build/aarch64/sirius
+          retention-days: 14

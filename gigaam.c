@@ -7,21 +7,30 @@
  *   -> greedy RNN-T loop (decoder LSTM + joint network) -> text
  *
  * Long audio is cut into chunks at quiet points to bound memory use.
+ *
+ * Two ways to use it (as `sirius transcribe ...`):
+ *   audio.wav          transcribe a WAV file and exit
+ *   -s < raw_pcm       stream mode: read raw 16 kHz mono 16-bit PCM from stdin (for example from
+ *                      arecord), load the model once, print one line of text per utterance
+ * and as a library for the rest of the program (gigaam.h).
  */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <err.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 
-#include "onnxruntime_c_api.h"
+#include "embed.h"
+#include "gigaam.h"
+#include "ortload.h"
 
 #define SAMPLE_RATE 16000
 #define ENC_DIM 768         /* encoder output width */
@@ -106,77 +115,108 @@ static float *read_wav(const char *path, size_t *n_samples) {
 
 /* -------------------------------------------------------------- engine -- */
 
-typedef struct {
+struct Engine {
     OrtEnv *env;
     OrtMemoryInfo *mem;
     OrtSession *pre, *enc, *dec, *joi;
     char *vocab[MAX_VOCAB];  /* token strings, U+2581 already replaced by ' '; NULL = never emitted */
     int vocab_size;
     int blank;
-} Engine;
+    Blob maps[5];            /* model files mapped from model_dir (unused for built-in models) */
+};
 
-/* Joins dir/file and checks that it is readable. */
-static void model_path(char *buf, size_t n, const char *dir, const char *file) {
-    snprintf(buf, n, "%s/%s", dir, file);
-    if (access(buf, R_OK)) errx(1, "missing model file: %s (run ./fetch.sh)", buf);
+/* The bytes of a model file: built into the binary, or mapped from dir/file. */
+static Blob model_blob(Engine *E, int slot, const char *dir, const char *file) {
+    Blob b = dir ? (Blob){0} : embedded(file);
+    if (b.p) return b;
+    if (!dir) errx(1, "this build has no built-in models; pass -m DIR (run ./fetch.sh first)");
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%s", dir, file);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) errx(1, "missing model file: %s (run ./fetch.sh)", path);
+    struct stat st;
+    if (fstat(fd, &st) || st.st_size <= 0) errx(1, "%s: cannot read", path);
+    void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);   /* page cache, not a heap copy */
+    if (m == MAP_FAILED) err(1, "%s", path);
+    close(fd);
+    return E->maps[slot] = (Blob){m, (size_t)st.st_size};
 }
 
-static OrtSession *open_session(Engine *E, const char *dir, const char *file, int threads) {
-    char path[4096];
-    model_path(path, sizeof path, dir, file);
+static OrtSession *open_session(Engine *E, int slot, const char *dir, const char *file, int threads) {
+    Blob b = model_blob(E, slot, dir, file);
     OrtSessionOptions *so;
     CK(ort->CreateSessionOptions(&so));
     CK(ort->SetIntraOpNumThreads(so, threads));
     CK(ort->SetInterOpNumThreads(so, 1));
     CK(ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
     OrtSession *s;
-    CK(ort->CreateSession(E->env, path, so, &s));
+    CK(ort->CreateSessionFromArray(E->env, b.p, b.n, so, &s));
     ort->ReleaseSessionOptions(so);
     return s;
 }
 
 static void load_vocab(Engine *E, const char *dir) {
-    char path[4096];
-    model_path(path, sizeof path, dir, "v3_e2e_rnnt_vocab.txt");
-    FILE *f = fopen(path, "rb");
-    if (!f) err(1, "%s", path);
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t len;
+    Blob b = model_blob(E, 4, dir, "v3_e2e_rnnt_vocab.txt");
+    const char *p = (const char *)b.p, *end = p + b.n;
     E->blank = -1;
-    while ((len = getline(&line, &cap, f)) > 0) {          /* lines look like "<token> <id>" */
-        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+    while (p < end) {                                       /* lines look like "<token> <id>" */
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        char *line = memcpy(xmalloc(len + 1), p, len);
+        p += len + 1;
+        while (len && (line[len - 1] == '\r' || line[len - 1] == 0)) len--;
+        line[len] = 0;
         char *sp = strrchr(line, ' ');
-        if (!sp) continue;
+        if (!sp) { free(line); continue; }
         int id = atoi(sp + 1);
         *sp = 0;
-        if (id < 0 || id >= MAX_VOCAB) errx(1, "%s: token id %d out of range (max %d)", path, id, MAX_VOCAB - 1);
-        if (!strcmp(line, "<unk>")) continue;               /* never printed */
+        if (id < 0 || id >= MAX_VOCAB) errx(1, "vocabulary: token id %d out of range (max %d)", id, MAX_VOCAB - 1);
+        if (!strcmp(line, "<unk>")) { free(line); continue; }   /* never printed */
         char *o = line;                                     /* replace U+2581 (E2 96 81) with ' ', in place */
-        for (const char *p = line; *p;) {
-            if (!strncmp(p, "\xE2\x96\x81", 3)) { *o++ = ' '; p += 3; }
-            else *o++ = *p++;
+        for (const char *q = line; *q;) {
+            if (!strncmp(q, "\xE2\x96\x81", 3)) { *o++ = ' '; q += 3; }
+            else *o++ = *q++;
         }
         *o = 0;
-        E->vocab[id] = memcpy(xmalloc(o - line + 1), line, o - line + 1);
+        if (E->vocab[id]) free(E->vocab[id]);
+        E->vocab[id] = line;
         if (id >= E->vocab_size) E->vocab_size = id + 1;
         if (!strcmp(line, "<blk>")) E->blank = id;
     }
-    free(line);
-    fclose(f);
-    if (E->blank < 0) errx(1, "%s: no <blk> token", path);
+    if (E->blank < 0) errx(1, "vocabulary has no <blk> token");
 }
 
-static void engine_init(Engine *E, const char *dir, int threads) {
-    ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+Engine *gigaam_open(const char *dir, int threads) {
+    if (threads <= 0) threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (threads < 1) threads = 1;
+    Engine *E = calloc(1, sizeof *E);
+    if (!E) errx(1, "out of memory");
+    ort = sirius_ort_base()->GetApi(ORT_API_VERSION);
     if (!ort) errx(1, "onnxruntime library is older than the headers");
     CK(ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "gigaam", &E->env));
     CK(ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &E->mem));
     load_vocab(E, dir);
-    E->pre = open_session(E, dir, "gigaam_v3.onnx", threads);
-    E->enc = open_session(E, dir, "v3_e2e_rnnt_encoder.int8.onnx", threads);
-    E->dec = open_session(E, dir, "v3_e2e_rnnt_decoder.int8.onnx", 1);
-    E->joi = open_session(E, dir, "v3_e2e_rnnt_joint.int8.onnx", 1);
+    E->pre = open_session(E, 0, dir, "gigaam_v3.onnx", threads);
+    E->enc = open_session(E, 1, dir, "v3_e2e_rnnt_encoder.int8.onnx", threads);
+    E->dec = open_session(E, 2, dir, "v3_e2e_rnnt_decoder.int8.onnx", 1);
+    E->joi = open_session(E, 3, dir, "v3_e2e_rnnt_joint.int8.onnx", 1);
+    for (int i = 0; i < 5; i++) {                           /* the models are parsed; their bytes are not needed now */
+        static const char *const names[5] = {"gigaam_v3.onnx", "v3_e2e_rnnt_encoder.int8.onnx",
+                                             "v3_e2e_rnnt_decoder.int8.onnx", "v3_e2e_rnnt_joint.int8.onnx",
+                                             "v3_e2e_rnnt_vocab.txt"};
+        blob_release(E->maps[i].p ? E->maps[i] : embedded(names[i]));
+    }
+    return E;
+}
+
+void gigaam_close(Engine *E) {
+    OrtSession *all[] = {E->pre, E->enc, E->dec, E->joi};
+    for (size_t i = 0; i < ND(all); i++) ort->ReleaseSession(all[i]);
+    ort->ReleaseMemoryInfo(E->mem);
+    ort->ReleaseEnv(E->env);
+    for (int i = 0; i < MAX_VOCAB; i++) free(E->vocab[i]);
+    for (size_t i = 0; i < ND(E->maps); i++) if (E->maps[i].p) munmap((void *)E->maps[i].p, E->maps[i].n);
+    free(E);
 }
 
 /* Wraps caller-owned memory in an ORT tensor; the byte size comes from the shape. */
@@ -333,60 +373,177 @@ static size_t find_cut(const float *x, size_t start, size_t end, size_t search) 
     return best;
 }
 
-static void usage(const char *a0) {
-    fprintf(stderr,
-            "usage: %s [-m model_dir] [-t threads] [-c chunk_seconds] [-v] audio.wav\n"
-            "  -m DIR   directory with the model files (default: ./models)\n"
-            "  -t N     CPU threads (default: all cores)\n"
-            "  -c SEC   max chunk length; longer audio is cut at quiet points (default 20, minimum 1, 0 = no chunking)\n"
-            "  -v       print timing and peak memory to stderr\n"
-            "audio.wav must be 16-bit PCM, mono, 16 kHz.\n", a0);
-}
-
-int main(int argc, char **argv) {
-#ifdef __GLIBC__
-    /* Pin glibc's mmap threshold. Its dynamic growth (triggered by freeing any large buffer) makes
-     * ONNX Runtime's big allocations stay resident: ~100 MB more peak memory, varying with the input. */
-    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
-#endif
-    const char *model_dir = "models", *wav_path = NULL;
-    int threads = (int)sysconf(_SC_NPROCESSORS_ONLN), verbose = 0;
-    double chunk_sec = 20;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-m") && i + 1 < argc) model_dir = argv[++i];
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-c") && i + 1 < argc) chunk_sec = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-v")) verbose = 1;
-        else if (argv[i][0] == '-') { usage(argv[0]); return 2; }
-        else wav_path = argv[i];
-    }
-    if (!wav_path) { usage(argv[0]); return 2; }
-    if (threads < 1) threads = 1;
-
-    size_t n;
-    float *pcm = read_wav(wav_path, &n);
-    double t0 = now();
-    Engine E = {0};
-    engine_init(&E, model_dir, threads);
-    double t_load = now() - t0;
-
-    size_t chunk = chunk_sec > 0 ? (size_t)(chunk_sec * SAMPLE_RATE) : n;
-    if (chunk < SAMPLE_RATE) chunk = SAMPLE_RATE;      /* guarantees the loop below makes progress */
-    size_t start = 0;
+/* Transcribes pcm[0..n) in pieces of at most `chunk` samples, cut at quiet points, and writes the text to
+ * `out`. Returns the number of pieces. */
+static int transcribe_long(Engine *E, float *pcm, size_t n, size_t chunk, FILE *out) {
     int nseg = 0, printed = 0;
-    t0 = now();
-    while (start < n) {
+    for (size_t start = 0; start < n;) {
         size_t end = start + chunk;
         if (end >= n || n - end < SAMPLE_RATE) end = n;   /* don't leave a tiny tail */
         else end = find_cut(pcm, start, end, (size_t)3 * SAMPLE_RATE);
         if (end - start >= 400) {                          /* skip < 25 ms of audio */
-            char *txt = transcribe(&E, pcm + start, end - start);
-            if (*txt) { printf("%s%s", printed ? " " : "", txt); printed = 1; }
+            char *txt = transcribe(E, pcm + start, end - start);
+            if (*txt) { fprintf(out, "%s%s", printed ? " " : "", txt); printed = 1; }
             free(txt);
             nseg++;
         }
         start = end;
     }
+    return nseg;
+}
+
+/* ------------------------------------------------------- stream mode -- */
+
+#define FRAME 320               /* 20 ms of audio */
+#define PREROLL_FRAMES 15       /* audio kept from before the first loud frame (300 ms) */
+#define START_FRAMES 3          /* loud frames in a row that start an utterance */
+#define END_FRAMES 35           /* quiet frames in a row that end it (700 ms) */
+#define KEEP_QUIET_FRAMES 10    /* quiet audio kept after the last speech (200 ms) */
+#define MIN_FRAMES 15           /* shorter utterances are ignored (300 ms) */
+#define MAX_UTT_SEC 30          /* longer ones are cut here */
+#define NOISE_FRAMES 150        /* the background level is the quietest frame of the last 3 s */
+
+/* Reads one FRAME of samples from fd. Returns 0 at the end of the input. */
+static int read_frame(int fd, int16_t *buf) {
+    size_t want = sizeof(int16_t) * FRAME, got = 0;
+    while (got < want) {
+        ssize_t r = read(fd, (char *)buf + got, want - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return 0;
+        got += (size_t)r;
+    }
+    return 1;
+}
+
+/* Finds utterances in the PCM stream on fd with a simple energy gate, transcribes each one and prints it
+ * as one line. `gate` is the speech level (RMS, 1 = full scale); the gate rises on its own in a noisy room. */
+static void stream_loop(Engine *E, int fd, FILE *out, int stamps, size_t chunk, double gate, int verbose) {
+#ifdef F_SETPIPE_SZ
+    fcntl(fd, F_SETPIPE_SZ, 1 << 20);   /* a pipe can then hold ~30 s of audio while we transcribe (fails quietly on files) */
+#endif
+    const size_t cap = (size_t)MAX_UTT_SEC * SAMPLE_RATE;
+    float *utt = xmalloc(cap * sizeof *utt), frame[FRAME];
+    int16_t raw[FRAME];
+    size_t n = 0;                                 /* samples in utt */
+    size_t consumed = 0;                          /* samples read so far */
+    double recent[NOISE_FRAMES];                  /* mean-square energy of the last NOISE_FRAMES frames */
+    int in_utt = 0, loud_run = 0, quiet_run = 0, next = 0;
+    for (int i = 0; i < NOISE_FRAMES; i++) recent[i] = 1e9;
+
+    for (int more = 1; more;) {
+        int end_utt = 0;
+        more = read_frame(fd, raw);
+        if (more) {
+            consumed += FRAME;
+            double e = 0, noise;
+            for (int i = 0; i < FRAME; i++) { frame[i] = raw[i] / 32768.0f; e += (double)frame[i] * frame[i]; }
+            e /= FRAME;
+            recent[next] = e;
+            next = (next + 1) % NOISE_FRAMES;
+            noise = recent[0];
+            for (int i = 1; i < NOISE_FRAMES; i++) if (recent[i] < noise) noise = recent[i];
+            int loud = e > (gate * gate > 9 * noise ? gate * gate : 9 * noise);   /* gate, or 3x the background */
+            if (!in_utt && n >= (size_t)PREROLL_FRAMES * FRAME) {   /* idle: keep just the last 300 ms */
+                memmove(utt, utt + FRAME, (n - FRAME) * sizeof *utt);
+                n -= FRAME;
+            }
+            memcpy(utt + n, frame, sizeof frame);
+            n += FRAME;
+            if (!in_utt) {
+                loud_run = loud ? loud_run + 1 : 0;
+                if (loud_run >= START_FRAMES) { in_utt = 1; quiet_run = 0; }
+            } else {
+                quiet_run = loud ? 0 : quiet_run + 1;
+                end_utt = quiet_run >= END_FRAMES || n + FRAME > cap;
+            }
+        } else {
+            end_utt = in_utt;                     /* end of input: transcribe what we have */
+        }
+        if (!end_utt) continue;
+
+        size_t len = n - (quiet_run > KEEP_QUIET_FRAMES ? quiet_run - KEEP_QUIET_FRAMES : 0) * FRAME;
+        if (len >= (size_t)MIN_FRAMES * FRAME) {
+            char *text = NULL;
+            size_t size = 0;
+            FILE *ms = open_memstream(&text, &size);
+            if (!ms) err(1, "open_memstream");
+            double t0 = now();
+            int nseg = transcribe_long(E, utt, len, chunk, ms);
+            fclose(ms);
+            if (size) {
+                if (stamps) {
+                    unsigned sec = (unsigned)((consumed - n) / SAMPLE_RATE);   /* where the buffer (with its 300 ms lead-in) starts */
+                    fprintf(out, "[%u:%02u:%02u] ", sec / 3600, sec / 60 % 60, sec % 60);
+                }
+                fwrite(text, 1, size, out);
+                fputc('\n', out);
+                fflush(out);
+            }
+            free(text);
+            if (verbose)
+                fprintf(stderr, "utterance %.1f s: transcribed in %.1f s (%d chunk(s))\n",
+                        (double)len / SAMPLE_RATE, now() - t0, nseg);
+        }
+        n = 0;
+        in_utt = loud_run = quiet_run = 0;
+    }
+    free(utt);
+}
+
+void gigaam_stream(Engine *E, int fd, FILE *out, int stamps, double gate, double chunk_sec, int verbose) {
+    size_t chunk = chunk_sec > 0 ? (size_t)(chunk_sec * SAMPLE_RATE) : (size_t)-1 / 2;
+    if (chunk < SAMPLE_RATE) chunk = SAMPLE_RATE;      /* guarantees the chunk loop makes progress */
+    stream_loop(E, fd, out, stamps, chunk, gate, verbose);
+}
+
+static void usage(const char *a0) {
+    fprintf(stderr,
+            "usage: %s [-m model_dir] [-t threads] [-c chunk_seconds] [-v] audio.wav\n"
+            "       %s -s [-g level] [-T] [-m model_dir] [-t threads] [-c chunk_seconds] [-v]\n"
+            "  -m DIR   read the models from this directory instead of the built-in ones\n"
+            "  -t N     CPU threads (default: all cores)\n"
+            "  -c SEC   max chunk length; longer audio is cut at quiet points (default 20, minimum 1, 0 = no chunking)\n"
+            "  -s       stream mode: read raw 16 kHz mono 16-bit PCM from stdin, print one line per utterance\n"
+            "  -g LEVEL speech level for stream mode, as a fraction of full scale (default 0.005)\n"
+            "  -T       start each stream-mode line with the time of the utterance, [h:mm:ss]\n"
+            "  -v       print timing and peak memory to stderr\n"
+            "audio.wav must be 16-bit PCM, mono, 16 kHz.\n", a0, a0);
+}
+
+int gigaam_main(int argc, char **argv) {
+    const char *model_dir = NULL, *wav_path = NULL;
+    int threads = 0, verbose = 0, stream = 0, stamps = 0;
+    double chunk_sec = 20, gate = 0.005;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-m") && i + 1 < argc) model_dir = argv[++i];
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) chunk_sec = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-g") && i + 1 < argc) gate = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-s")) stream = 1;
+        else if (!strcmp(argv[i], "-T")) stamps = 1;
+        else if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (argv[i][0] == '-') { usage(argv[0]); return 2; }
+        else wav_path = argv[i];
+    }
+    if (stream == (wav_path != NULL) || gate <= 0) { usage(argv[0]); return 2; }   /* a file or -s, not both */
+
+    size_t n = 0;
+    float *pcm = stream ? NULL : read_wav(wav_path, &n);
+    double t0 = now();
+    Engine *E = gigaam_open(model_dir, threads);
+    double t_load = now() - t0;
+    if (threads <= 0) threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (stream) {
+        if (verbose) fprintf(stderr, "model loaded in %.1f s, listening on stdin\n", t_load);
+        gigaam_stream(E, STDIN_FILENO, stdout, stamps, gate, chunk_sec, verbose);
+        return 0;
+    }
+
+    size_t chunk = chunk_sec > 0 ? (size_t)(chunk_sec * SAMPLE_RATE) : (size_t)-1 / 2;
+    if (chunk < SAMPLE_RATE) chunk = SAMPLE_RATE;
+    t0 = now();
+    int nseg = transcribe_long(E, pcm, n, chunk, stdout);
     printf("\n");
     if (verbose) {
         struct rusage ru;
@@ -394,6 +551,11 @@ int main(int argc, char **argv) {
         double dt = now() - t0;
         fprintf(stderr, "audio %.1f s, %d chunk(s), load %.1f s, decode %.1f s (%.2fx real time), peak RSS %ld MB, %d thread(s)\n",
                 (double)n / SAMPLE_RATE, nseg, t_load, dt, dt / ((double)n / SAMPLE_RATE), ru.ru_maxrss / 1024, threads);
+        FILE *st = fopen("/proc/self/status", "r");        /* what is resident now: private memory vs. file-backed */
+        for (char line[128]; st && fgets(line, sizeof line, st);)
+            if (!strncmp(line, "RssAnon:", 8) || !strncmp(line, "RssFile:", 8) || !strncmp(line, "RssShmem:", 9))
+                fputs(line, stderr);
+        if (st) fclose(st);
     }
     return 0;
 }
